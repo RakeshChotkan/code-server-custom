@@ -3,6 +3,7 @@ name: Image bouwen
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md"]
   schedule:
     - cron: "0 5 * * 1"   # elke maandag: een nieuwe code-server-versie ophalen
   workflow_dispatch:
