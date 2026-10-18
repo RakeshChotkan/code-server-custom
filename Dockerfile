@@ -10,9 +10,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Testharnas van T-Tool in de systeem-Python, zodat 'bash tests/run_all.sh' meteen werkt
-RUN pip install --break-system-packages --no-cache-dir pyte vermin flake8
+RUN pip install --break-system-packages --no-cache-dir pyte vermin flake8 coverage
 
 # Controle: faalt de build hier, dan ontbreekt er iets
-RUN python3 -c 'import pyte, curses' \
+RUN python3 -c 'import pyte, coverage, curses' \
  && svn --version --quiet && svnadmin --version --quiet && gh --version \
  && vermin --version && flake8 --version && pandoc --version | head -1
