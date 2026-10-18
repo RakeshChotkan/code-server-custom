@@ -1,0 +1,55 @@
+#!/bin/bash
+# gemini-review: laat Gemini (Antigravity CLI, agy) de niet-gecommitte wijzigingen in de
+# huidige git-repository reviewen. Alleen lezen: agy draait in plan-modus en past niets aan.
+#
+# Gebruik: gemini-review [git-diff-argumenten]
+#   gemini-review              alles sinds HEAD, inclusief nieuwe (untracked) bestanden
+#   gemini-review --cached     alleen wat gestaged is
+#   gemini-review main...HEAD  een hele branch
+# Ander model: GEMINI_REVIEW_MODEL=<slug> (zie 'agy models'); anders het standaardmodel.
+# Eerst één keer inloggen met 'agy' (Google-account met Google AI Pro).
+set -euo pipefail
+
+agy=$(command -v agy || echo "$HOME/.local/bin/agy")
+[ -x "$agy" ] || { echo "gemini-review: agy (Antigravity CLI) niet gevonden" >&2; exit 1; }
+top=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || { echo "gemini-review: geen git-repository" >&2; exit 1; }
+cd "$top"
+
+if [ $# -gt 0 ]; then
+    diff=$(git diff "$@")
+else
+    # git diff --no-index geeft exit 1 bij verschillen, xargs dan 123
+    diff=$(git diff HEAD
+           git ls-files --others --exclude-standard -z \
+               | xargs -0 -r -n1 git diff --no-index -- /dev/null || true)
+fi
+[ -n "$diff" ] || { echo "gemini-review: geen wijzigingen om te reviewen"; exit 0; }
+
+instructie="Je bent een ervaren code-reviewer. Review de wijzigingen in de diff van de
+repository $(basename "$top"). Zoek naar bugs, gemiste randgevallen, beveiligingsproblemen,
+foutafhandeling en code die simpeler of duidelijker kan. Je mag andere bestanden in de
+repository lezen voor context, maar pas niets aan. Geef per bevinding: bestand:regel,
+ernst (hoog/middel/laag), het probleem en een concreet voorstel. Noem alleen echte
+problemen, de ernstigste eerst; vind je niets, zeg dat dan. Antwoord in het Nederlands."
+
+opties=(--mode plan --disable-slash-commands --print-timeout 15m)
+if [ -n "${GEMINI_REVIEW_MODEL:-}" ]; then
+    opties+=(--model "$GEMINI_REVIEW_MODEL")
+fi
+
+if [ "$(printf '%s' "$diff" | wc -c)" -le 100000 ]; then
+    exec "$agy" "${opties[@]}" -p "$instructie
+
+\`\`\`diff
+$diff
+\`\`\`"
+fi
+
+# Te groot voor één argument (Linux: max. 128 KB per argument): via een bestand
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+printf '%s\n' "$diff" > "$tmp/wijzigingen.diff"
+"$agy" "${opties[@]}" --add-dir "$tmp" -p "$instructie
+
+De diff staat in $tmp/wijzigingen.diff."

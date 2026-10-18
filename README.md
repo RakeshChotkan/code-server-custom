@@ -8,3 +8,18 @@ code-server-versie mee) en zet het op `ghcr.io/rakeshchotkan/code-server-custom:
 
 Portainer: zet `image: ghcr.io/rakeshchotkan/code-server-custom:latest` en werk de stack
 bij met "Re-pull image" aan. Zet `PUID`/`PGID` op de eigenaar van de gekoppelde mappen.
+
+## Gemini (Antigravity CLI)
+
+Het image bevat ook de Antigravity CLI (`agy`), de opvolger van de Gemini CLI, en het
+script `gemini-review`. Daarmee kan Claude Code de niet-gecommitte wijzigingen door
+Gemini laten reviewen, op het Google AI Pro-abonnement (geen API-key nodig).
+
+- Eén keer inloggen: start `agy` in een terminal, open de getoonde URL, log in met het
+  Google-account met Google AI Pro en plak de code terug. De sessie staat in `~/.gemini`
+  (op `/config`) en blijft dus bewaard bij een nieuw image.
+- `gemini-review` (in een git-repository): stuurt de diff sinds HEAD, inclusief nieuwe
+  bestanden, naar Gemini in plan-modus; Gemini past niets aan. Ander bereik:
+  `gemini-review --cached` of `gemini-review main...HEAD`. Ander model:
+  `GEMINI_REVIEW_MODEL=<slug>` (lijst: `agy models`).
+- Quotum bekijken: `agy -p "/usage"`.

@@ -12,7 +12,19 @@ RUN apt-get update \
 # Testharnas van T-Tool in de systeem-Python, zodat 'bash tests/run_all.sh' meteen werkt
 RUN pip install --break-system-packages --no-cache-dir pyte vermin flake8 coverage
 
+# Antigravity CLI (agy), de opvolger van de Gemini CLI: Gemini met het Google AI Pro-abonnement.
+# Het officiële script controleert de SHA512 van de download. Eén keer inloggen met 'agy';
+# de sessie staat in ~/.gemini (op /config, blijft dus bewaard). De wekelijkse build haalt
+# een nieuwe versie op (de ingebouwde self-update mag als abc niet in /usr/local/bin schrijven).
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+ && rm -rf /root/.cache/antigravity /root/.gemini
+
+# gemini-review: laat Gemini de niet-gecommitte wijzigingen reviewen (alleen lezen)
+COPY --chmod=755 gemini-review /usr/local/bin/gemini-review
+
 # Controle: faalt de build hier, dan ontbreekt er iets
 RUN python3 -c 'import pyte, coverage, curses' \
  && svn --version --quiet && svnadmin --version --quiet && gh --version \
- && vermin --version && flake8 --version && pandoc --version | head -1
+ && vermin --version && flake8 --version && pandoc --version | head -1 \
+ && agy --version && bash -n /usr/local/bin/gemini-review \
+ && rm -rf /root/.gemini
