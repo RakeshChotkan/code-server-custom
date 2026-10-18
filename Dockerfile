@@ -16,15 +16,17 @@ RUN pip install --break-system-packages --no-cache-dir pyte vermin flake8 covera
 # Het officiële script controleert de SHA512 van de download. Eén keer inloggen met 'agy';
 # de sessie staat in ~/.gemini (op /config, blijft dus bewaard). De wekelijkse build haalt
 # een nieuwe versie op (de ingebouwde self-update mag als abc niet in /usr/local/bin schrijven).
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+# HOME=/root: het basisimage zet HOME=/config, en daar schrijft het script (cache, PATH in .bashrc)
+RUN curl -fsSL https://antigravity.google/cli/install.sh | HOME=/root bash -s -- --dir /usr/local/bin \
  && rm -rf /root/.cache/antigravity /root/.gemini
 
-# gemini-review: laat Gemini de niet-gecommitte wijzigingen reviewen (alleen lezen)
+# gemini-review (Python, standaardbibliotheek): Gemini reviewt wijzigingen, de hele code of een
+# voorstel (alleen lezen)
 COPY --chmod=755 gemini-review /usr/local/bin/gemini-review
 
 # Controle: faalt de build hier, dan ontbreekt er iets
 RUN python3 -c 'import pyte, coverage, curses' \
  && svn --version --quiet && svnadmin --version --quiet && gh --version \
  && vermin --version && flake8 --version && pandoc --version | head -1 \
- && agy --version && bash -n /usr/local/bin/gemini-review \
+ && HOME=/root agy --version && gemini-review --help > /dev/null \
  && rm -rf /root/.gemini

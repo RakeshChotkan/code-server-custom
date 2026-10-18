@@ -1,55 +1,663 @@
-#!/bin/bash
-# gemini-review: laat Gemini (Antigravity CLI, agy) de niet-gecommitte wijzigingen in de
-# huidige git-repository reviewen. Alleen lezen: agy draait in plan-modus en past niets aan.
-#
-# Gebruik: gemini-review [git-diff-argumenten]
-#   gemini-review              alles sinds HEAD, inclusief nieuwe (untracked) bestanden
-#   gemini-review --cached     alleen wat gestaged is
-#   gemini-review main...HEAD  een hele branch
-# Ander model: GEMINI_REVIEW_MODEL=<slug> (zie 'agy models'); anders het standaardmodel.
-# Eerst één keer inloggen met 'agy' (Google-account met Google AI Pro).
-set -euo pipefail
+#!/usr/bin/env python3
+"""gemini-review: laat Gemini (Antigravity CLI, agy) code reviewen of een voorstel beoordelen.
+Alleen lezen: agy draait in plan-modus, krijgt alle code in de prompt en hoeft geen tools te
+gebruiken. Werkt in een git-repository.
 
-agy=$(command -v agy || echo "$HOME/.local/bin/agy")
-[ -x "$agy" ] || { echo "gemini-review: agy (Antigravity CLI) niet gevonden" >&2; exit 1; }
-top=$(git rev-parse --show-toplevel 2>/dev/null) \
-    || { echo "gemini-review: geen git-repository" >&2; exit 1; }
-cd "$top"
+    gemini-review                      de niet-gecommitte wijzigingen (ook nieuwe bestanden)
+    gemini-review <git-diff-args>      bv. --cached, of main...HEAD -- ttool tests
+    gemini-review --alles              de hele codebase (paden uit .gemini-review)
+    gemini-review --advies VOORSTEL.md [pad ...]
+                                       second opinion op een voorstel, met de genoemde
+                                       bestanden en een kaart van de hele codebase als
+                                       context (Gemini mag losse bestanden lezen)
+    gemini-review --samenvoegen NAAM=bevindingen.json NAAM=... [--titel TEKST]
+                                       bevindingen uit meer bronnen (bv. Gemini en Claude)
+                                       samenvoegen tot één rapport; wat meer bronnen vonden,
+                                       staat erbij
 
-if [ $# -gt 0 ]; then
-    diff=$(git diff "$@")
-else
-    # git diff --no-index geeft exit 1 bij verschillen, xargs dan 123
-    diff=$(git diff HEAD
-           git ls-files --others --exclude-standard -z \
-               | xargs -0 -r -n1 git diff --no-index -- /dev/null || true)
-fi
-[ -n "$diff" ] || { echo "gemini-review: geen wijzigingen om te reviewen"; exit 0; }
+Opties: --opnieuw (cache negeren), --parallel N (standaard 2), --droog (alleen tonen
+welke aanroepen en hoe groot, zonder Gemini aan te roepen).
+Model: GEMINI_REVIEW_MODEL (standaard gemini-3.8-flash-high; lijst: agy models).
 
-instructie="Je bent een ervaren code-reviewer. Review de wijzigingen in de diff van de
-repository $(basename "$top"). Zoek naar bugs, gemiste randgevallen, beveiligingsproblemen,
-foutafhandeling en code die simpeler of duidelijker kan. Je mag andere bestanden in de
-repository lezen voor context, maar pas niets aan. Geef per bevinding: bestand:regel,
-ernst (hoog/middel/laag), het probleem en een concreet voorstel. Noem alleen echte
-problemen, de ernstigste eerst; vind je niets, zeg dat dan. Antwoord in het Nederlands."
+Zuinig met tokens: elke aanroep kost ~13.000 tokens vaste overhead, dus zo min mogelijk,
+zo groot mogelijke aanroepen (tot ~110 KB code, de grens van één argument); geen diff-
+tekens voor een volledige review; geen tools; hooguit 15 bevindingen per deel; en bij
+--alles worden alleen de bestanden verstuurd die sinds de vorige review veranderd zijn: de
+bevindingen van de andere komen uit de cache per bestand.
 
-opties=(--mode plan --disable-slash-commands --print-timeout 15m)
-if [ -n "${GEMINI_REVIEW_MODEL:-}" ]; then
-    opties+=(--model "$GEMINI_REVIEW_MODEL")
-fi
+Uitvoer in .git/gemini-review/<tijd>-<soort>/: rapport.md (gesorteerd op ernst),
+bevindingen.json en per aanroep de ruwe JSON. Exit 0 = gelukt, 1 = een deel mislukt,
+2 = verkeerde aanroep, 3 = niet ingelogd of quotum op.
 
-if [ "$(printf '%s' "$diff" | wc -c)" -le 100000 ]; then
-    exec "$agy" "${opties[@]}" -p "$instructie
+Per repository (optioneel) een bestand .gemini-review:
 
-\`\`\`diff
-$diff
-\`\`\`"
-fi
+    [review]
+    paden = src tests            ; voor --alles (standaard: alle bestanden in git)
+    context = Korte beschrijving van het project en de belangrijkste regels.
+    afspraken = CLAUDE.md        ; voor de samenhangronde en --advies
+"""
+import ast
+import concurrent.futures
+import configparser
+import datetime
+import difflib
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
 
-# Te groot voor één argument (Linux: max. 128 KB per argument): via een bestand
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-printf '%s\n' "$diff" > "$tmp/wijzigingen.diff"
-"$agy" "${opties[@]}" --add-dir "$tmp" -p "$instructie
+AGY = next((p for p in ("/usr/local/bin/agy", os.path.expanduser("~/.local/bin/agy"))
+            if os.access(p, os.X_OK)), "agy")
+MODEL = os.environ.get("GEMINI_REVIEW_MODEL", "gemini-3.8-flash-high")
+VERSIE = "2"                    # verhogen als de prompts veranderen: de cache vervalt dan
+MAX_DEEL = 110000               # bytes code per aanroep (één argument mag max. 128 KB zijn)
+TIJD = 20 * 60                  # seconden per aanroep
+MAX_PROMPT = 127000             # bytes: de grens van één argument (128 KB) met wat marge
+LOPEND, SLOT = set(), threading.Lock()      # lopende agy-processen, om te stoppen bij Stop
+GESTOPT = threading.Event()                 # gezet bij Stop: geen nieuwe pogingen meer
 
-De diff staat in $tmp/wijzigingen.diff."
+BEVINDING = {
+    "type": "object",
+    "properties": {
+        "bestand": {"type": "string"},
+        "regel": {"type": "integer"},
+        "ernst": {"type": "string", "enum": ["hoog", "middel", "laag"]},
+        "soort": {"type": "string", "enum": ["fout", "beveiliging", "randgeval",
+                                             "afspraak", "onderhoud", "eenvoud"]},
+        "probleem": {"type": "string"},
+        "voorstel": {"type": "string"},
+    },
+    "required": ["bestand", "regel", "ernst", "soort", "probleem", "voorstel"],
+}
+SCHEMA_REVIEW = {"type": "object", "required": ["bevindingen"],
+                 "properties": {"bevindingen": {"type": "array", "items": BEVINDING}}}
+SCHEMA_ADVIES = {
+    "type": "object", "required": ["punten"],
+    "properties": {"punten": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "onderwerp": {"type": "string"},
+            "ernst": {"type": "string", "enum": ["hoog", "middel", "laag"]},
+            "soort": {"type": "string", "enum": ["risico", "randgeval", "alternatief",
+                                                 "afspraak", "vraag"]},
+            "toelichting": {"type": "string"},
+            "voorstel": {"type": "string"},
+        },
+        "required": ["onderwerp", "ernst", "soort", "toelichting", "voorstel"]}}},
+}
+
+REGELS = """Antwoord in het Nederlands. Gebruik geen tools en voer niets uit: alles wat je
+nodig hebt staat in deze prompt. Noem alleen echte problemen (geen smaak, geen opmaak die een
+linter al vangt), hooguit 15, de ernstigste eerst; niets gevonden = een lege lijst. Per
+bevinding: het bestand en het regelnummer zoals hieronder vermeld, ernst, soort, het probleem
+in één tot drie zinnen en een concreet voorstel (kort; code alleen als het echt helpt)."""
+
+
+class Stop(Exception):
+    """Niet ingelogd of quotum op: verder gaan heeft geen zin."""
+
+
+def git(*args, binair=False):
+    uit = subprocess.run(["git"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if uit.returncode != 0:
+        raise SystemExit("gemini-review: git %s: %s" % (" ".join(args),
+                                                        uit.stderr.decode().strip()))
+    return uit.stdout if binair else uit.stdout.decode("utf-8", "replace")
+
+
+def heeft_commit():
+    return subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
+def instellingen():
+    c = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+    c.read(".gemini-review", encoding="utf-8")
+    r = c["review"] if c.has_section("review") else {}
+    return {"paden": r.get("paden", "").split(), "context": r.get("context", "").strip(),
+            "afspraken": r.get("afspraken", "").strip()}
+
+
+def lees(pad):
+    try:
+        with open(pad, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+# ---------------------------------------------------------------- delen maken
+
+def genummerd(pad, tekst, eerste=1):
+    regels = tekst.splitlines()
+    return "=== %s\n%s\n" % (pad, "\n".join("%d|%s" % (eerste + i, r)
+                                            for i, r in enumerate(regels)))
+
+
+def code_delen(bestanden):
+    """Volledige bestanden met regelnummers, in delen van hooguit MAX_DEEL; een te groot
+    bestand wordt op regelgrenzen geknipt. Bestanden van één map blijven bij elkaar.
+    Geeft [(inhoud, {paden})]."""
+    stukken = []
+    for pad in bestanden:
+        tekst = lees(pad)
+        if not tekst or "\0" in tekst:
+            continue
+        regels = tekst.splitlines()
+        blok, start, maat = [], 1, 0
+        for i, r in enumerate(regels, 1):
+            blok.append(r)
+            maat += len(r.encode()) + 8            # + regelnummer en scheidingsteken
+            if maat > MAX_DEEL - 2000:
+                stukken.append((genummerd("%s (regels %d-%d)" % (pad, start, i),
+                                          "\n".join(blok), start), pad))
+                blok, start, maat = [], i + 1, 0
+        if blok:
+            naam = pad if start == 1 else "%s (regels %d-%d)" % (pad, start, len(regels))
+            stukken.append((genummerd(naam, "\n".join(blok), start), pad))
+    return bundel(stukken)
+
+
+def diff_delen(diff):
+    """Een diff per bestand, gebundeld tot delen van hooguit MAX_DEEL."""
+    stukken = [s for s in re.split(r"(?m)^(?=diff --git )", diff) if s.strip()]
+    uit = []
+    for s in stukken:
+        while len(s.encode()) > MAX_DEEL:     # één enorm bestand: op regelgrenzen knippen
+            knip = s.rfind("\n", 0, MAX_DEEL - 2000)
+            if knip < 0:                      # één regel zonder einde: hard knippen
+                knip = MAX_DEEL - 2001
+            uit.append(s[:knip + 1])
+            s = s[knip + 1:]
+        uit.append(s)
+    return [inhoud for inhoud, _ in bundel([(s, None) for s in uit])]
+
+
+def bundel(stukken):
+    """[(tekst, pad)] -> [(inhoud, {paden})], in volgorde, elk deel hooguit MAX_DEEL."""
+    delen, huidig, paden = [], "", set()
+    for s, pad in stukken:
+        if huidig and len((huidig + s).encode()) > MAX_DEEL:
+            delen.append((huidig, paden))
+            huidig, paden = "", set()
+        huidig += s
+        paden.add(pad)
+    if huidig:
+        delen.append((huidig, paden))
+    return delen
+
+
+# ---------------------------------------------------------------- cache per bestand
+# Bij --alles worden de bevindingen ook per bestand bewaard (sleutel: model, promptversie,
+# context, pad en inhoud). Een volgende volledige review stuurt alleen de bestanden die
+# veranderd zijn; de rest komt hieruit. Zo schuiven er geen deelgrenzen op.
+
+def bestand_sleutel(context, pad):
+    inhoud = lees(pad) or ""
+    return hashlib.sha256("\0".join((VERSIE, MODEL, context, pad, inhoud)).encode()).hexdigest()
+
+
+def schoon_pad(naam):
+    """'./x.py (regels 1-9)' -> 'x.py'; '.github/...' blijft heel."""
+    naam = re.sub(r"\s*\(regels [0-9-]+\)$", "", naam.strip())
+    return naam[2:] if naam.startswith("./") else naam
+
+
+def bij_bestand(b, paden):
+    """Het pad uit `paden` waar bevinding b bij hoort ('x.py (regels 1-9)' -> 'x.py')."""
+    naam = schoon_pad(b.get("bestand", ""))
+    if naam in paden:
+        return naam
+    for p in sorted(paden):
+        if p.endswith("/" + naam) or naam.endswith("/" + p):
+            return p
+    return sorted(paden)[0]
+
+
+def overzicht(bestanden):
+    """Compacte kaart van de code voor de samenhangronde: per bestand de imports en de
+    functies/klassen met hun parameters (Python), of de functies (shell)."""
+    regels = []
+    for pad in bestanden:
+        tekst = lees(pad)
+        if not tekst:
+            continue
+        if pad.endswith(".py") or tekst.startswith("#!/usr/bin/env python"):
+            try:
+                boom = ast.parse(tekst)
+            except SyntaxError:
+                continue
+            imp, defs = [], []
+            for n in boom.body:
+                if isinstance(n, ast.Import):
+                    imp += [a.name for a in n.names]
+                elif isinstance(n, ast.ImportFrom):
+                    imp.append("%s%s" % ("." * n.level, n.module or ""))
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if isinstance(n, ast.ClassDef):
+                        defs.append("class %s" % n.name)
+                    else:
+                        defs.append("%s(%s):%d" % (n.name, ", ".join(a.arg for a in n.args.args),
+                                                   n.lineno))
+            regels.append("%s | import %s | %s" % (pad, ", ".join(imp), "; ".join(defs)))
+        elif tekst.startswith("#!") and "sh" in tekst.split("\n", 1)[0]:
+            fn = re.findall(r"(?m)^\s*([A-Za-z_][\w-]*)\s*\(\)\s*\{", tekst)
+            regels.append("%s | shell | %s" % (pad, "; ".join(fn)))
+    return "\n".join(regels)
+
+
+# ---------------------------------------------------------------- Gemini aanroepen
+
+def vraag(prompt, schema, map_, naam, cache, opnieuw):
+    """Eén aanroep van agy; geeft (structured_output, verbruik, uit_cache). Probeert één keer
+    opnieuw bij een lege of ongeldige uitvoer. Met opnieuw wordt de cache niet gelezen (wel
+    bijgewerkt)."""
+    if len(prompt.encode()) > MAX_PROMPT:
+        raise RuntimeError("prompt te groot (%d KB, max. %d KB); maak de invoer kleiner"
+                           % (len(prompt.encode()) // 1024, MAX_PROMPT // 1024))
+    sleutel = hashlib.sha256((VERSIE + MODEL + json.dumps(schema) + prompt).encode()).hexdigest()
+    cpad = os.path.join(cache, sleutel + ".json")
+    if os.path.exists(cpad) and not opnieuw:
+        with open(cpad, encoding="utf-8") as f:
+            data = json.load(f)
+        bewaar(map_, naam, data)
+        return data["structured_output"], data.get("usage", {}), True
+    fout, vraagtekst = "", prompt
+    for _ in range(2):
+        if GESTOPT.is_set():
+            raise Stop("gestopt")
+        p = subprocess.Popen([AGY, "--model", MODEL, "--mode", "plan", "--output-format", "json",
+                              "--json-schema", json.dumps(schema), "--print-timeout",
+                              "%dm" % (TIJD // 60), "-p", vraagtekst],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+        with SLOT:
+            LOPEND.add(p)
+        try:
+            # stdout is alleen de JSON; stderr (waarschuwingen, meldingen) apart
+            uit, err = (x.decode("utf-8", "replace") for x in p.communicate(timeout=TIJD + 60))
+        except subprocess.TimeoutExpired:
+            stop_proces(p)
+            p.communicate()
+            fout = "time-out na %d minuten" % (TIJD // 60)
+            continue
+        finally:
+            with SLOT:
+                LOPEND.discard(p)
+        if GESTOPT.is_set():
+            raise Stop("gestopt")
+        try:
+            data = json.loads(uit)
+        except ValueError:
+            try:                            # voor de zekerheid: eerste JSON-object in de uitvoer
+                data = json.JSONDecoder().raw_decode(uit[uit.index("{"):])[0]
+            except ValueError:
+                data = {}
+        if data.get("status") == "SUCCESS" and isinstance(data.get("structured_output"), dict):
+            bewaar(map_, naam, data)
+            with open(cpad, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            return data["structured_output"], data.get("usage", {}), False
+        # Geen geldig antwoord: alleen dan zoeken naar login- en quotummeldingen (in een
+        # geldig antwoord kan zo'n woord, of een regelnummer als 429, gewoon voorkomen).
+        melding = ((str(data.get("error") or data.get("response") or "") if data else uit)
+                   + "\n" + err).strip()
+        if re.search(r"Authentication required|authentication (failed|timed out)", melding):
+            raise Stop("niet ingelogd: start 'agy' in een terminal en log in met het "
+                       "Google-account met Google AI Pro")
+        if re.search(r"RESOURCE_EXHAUSTED|quota (exceeded|exhausted|reached)|"
+                     r"rate.?limit|\b429\b", melding, re.I):
+            raise Stop("quotum op of te veel verzoeken: %s" % melding[-300:])
+        fout = ("status %s: %s" % (data.get("status"), melding[-300:]) if data
+                else melding[-300:] or "geen uitvoer")
+        if re.search(r"output token limit|cut off", melding, re.I):
+            # Antwoord te lang: de tweede poging vraagt om een korter antwoord (de cache
+            # houdt de sleutel van de oorspronkelijke prompt).
+            vraagtekst = prompt + ("\n\nLET OP: je vorige antwoord was te lang. Geef nu hooguit "
+                                   "8 bevindingen, met elk probleem en voorstel in één zin.")
+    raise RuntimeError(fout)
+
+
+def stop_proces(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def bewaar(map_, naam, data):
+    with open(os.path.join(map_, naam + ".json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+
+
+def review_prompt(context, inhoud, soort):
+    wat = {"code": "Review de volgende code (met regelnummers) op fouten, beveiliging, gemiste "
+                   "randgevallen, foutafhandeling, strijdigheid met de projectafspraken, en "
+                   "code die duidelijk eenvoudiger kan.",
+           "diff": "Review de wijzigingen in deze git-diff op fouten, beveiliging, gemiste "
+                   "randgevallen, foutafhandeling, strijdigheid met de projectafspraken, en "
+                   "code die duidelijk eenvoudiger kan. Gebruik de regelnummers van de nieuwe "
+                   "versie (uit de @@-koppen)."}[soort]
+    return "%s\n\nProject: %s\n\n%s\n\n%s" % (wat, context or "(geen beschrijving)", REGELS,
+                                              inhoud)
+
+
+def samenhang_prompt(context, afspraken, kaart):
+    return ("Je krijgt een kaart van een hele codebase (per bestand de imports en de functies "
+            "met parameters en regelnummer) en de afspraken van het project. De bestanden "
+            "zelf zijn al los gereviewd. Zoek nu alleen naar problemen tussen modules: "
+            "verkeerde of inconsistente aanroepen, dubbele logica die uit elkaar kan lopen, "
+            "afspraken die op de ene plek wel en op de andere niet gevolgd worden, en zwakke "
+            "plekken in de opbouw. Je mag een bestand lezen (read_file) als je een vermoeden "
+            "moet controleren, maar doe dat spaarzaam; voer geen opdrachten uit.\n\n"
+            "Project: %s\n\n%s\n\n--- Afspraken ---\n%s\n\n--- Kaart ---\n%s"
+            % (context, REGELS.replace("Gebruik geen tools en voer niets uit: alles wat je\n"
+                                       "nodig hebt staat in deze prompt. ", ""),
+               afspraken or "(geen)", kaart))
+
+
+def advies_prompt(context, afspraken, voorstel, code, kaart):
+    return ("Geef een second opinion op het voorstel hieronder voor nieuwe functionaliteit. "
+            "Beoordeel: risico's en fouten in de aanpak, gemiste randgevallen, betere of "
+            "eenvoudigere alternatieven, strijdigheid met de afspraken van het project, en "
+            "open vragen die eerst beantwoord moeten worden. Antwoord in het Nederlands, "
+            "zakelijk, hooguit 12 punten, de belangrijkste eerst. De belangrijkste code staat "
+            "hieronder, met een kaart van de hele codebase (per bestand de imports en de "
+            "functies). Wil je een ander bestand zien, lees het dan (read_file, pad ten opzichte "
+            "van %s), maar spaarzaam: elke leesactie kost tokens. Voer geen opdrachten uit."
+            "\n\nProject: %s\n\n--- Afspraken ---\n%s\n\n--- Voorstel ---\n%s"
+            "\n\n--- Bestaande code ---\n%s\n\n--- Kaart van de codebase ---\n%s"
+            % (os.getcwd(), context, afspraken or "(geen)", voorstel,
+               code or "(geen meegegeven)", kaart or "(geen)"))
+
+
+# ---------------------------------------------------------------- rapport
+
+ERNST = {"hoog": 0, "middel": 1, "laag": 2}
+
+
+def rapport(map_, titel, bevindingen, kop):
+    uniek, gezien = [], set()
+    for b in bevindingen:
+        sleutel = (b.get("bestand", b.get("onderwerp", "")), b.get("regel"),
+                   re.sub(r"\W+", " ", b.get("probleem", b.get("toelichting", "")))[:60].lower())
+        if sleutel not in gezien:
+            gezien.add(sleutel)
+            uniek.append(b)
+    for b in uniek:
+        if "bestand" in b:
+            b["regel"] = b.get("regel") or 0
+    uniek.sort(key=lambda b: (ERNST.get(b["ernst"], 3), -len(b.get("bron", [])),
+                              b.get("bestand", ""), b.get("regel") or 0))
+    with open(os.path.join(map_, "bevindingen.json"), "w", encoding="utf-8") as f:
+        json.dump(uniek, f, ensure_ascii=False, indent=1)
+    r = ["# %s" % titel, ""] + kop + [""]
+    if not uniek:
+        r.append("Geen bevindingen.")
+    for i, b in enumerate(uniek, 1):
+        bron = "  \n   *Gevonden door:* %s" % " en ".join(b["bron"]) if b.get("bron") else ""
+        if "bestand" in b:
+            r.append("%d. **%s** `%s:%s` (%s) %s  \n   *Voorstel:* %s%s"
+                     % (i, b["ernst"], b["bestand"], b["regel"], b["soort"], b["probleem"],
+                        b["voorstel"], bron))
+        else:
+            r.append("%d. **%s** %s (%s): %s  \n   *Voorstel:* %s"
+                     % (i, b["ernst"], b["onderwerp"], b["soort"], b["toelichting"],
+                        b["voorstel"]))
+    pad = os.path.join(map_, "rapport.md")
+    with open(pad, "w", encoding="utf-8") as f:
+        f.write("\n".join(r) + "\n")
+    return pad, uniek
+
+
+def zelfde(a, b):
+    """Gaat het waarschijnlijk om hetzelfde probleem? Zelfde bestand, regels dicht bij elkaar,
+    en dezelfde soort of een gelijkende omschrijving."""
+    if "bestand" not in a or "bestand" not in b:     # punten van --advies: op onderwerp
+        return a.get("onderwerp") == b.get("onderwerp")
+    if a.get("bestand") != b.get("bestand") or \
+            abs((a.get("regel") or 0) - (b.get("regel") or 0)) > 3:
+        return False
+    # Vergelijk op woorden, niet op letters (letters geven bij elke Nederlandse zin al snel
+    # 0,3). Liever een dubbel punt twee keer tonen dan twee verschillende samenvoegen.
+    woorden = [re.findall(r"\w{3,}", x.get("probleem", "").lower()) for x in (a, b)]
+    tekst = difflib.SequenceMatcher(None, *woorden).ratio()
+    zelfde_regel = (a.get("regel") or 0) == (b.get("regel") or 0)
+    return tekst >= 0.4 or (zelfde_regel and a.get("soort") == b.get("soort"))
+
+
+def samenvoegen(bronnen):
+    """[(naam, [bevindingen])] -> één lijst; dubbele bevindingen krijgen alle bronnen en de
+    hoogste ernst."""
+    uit = []
+    for naam, lijst in bronnen:
+        for b in lijst:
+            b = dict(b)
+            if "bestand" in b:
+                b["bestand"] = schoon_pad(b["bestand"])
+                b["regel"] = b.get("regel") or 0
+            gelijk = next((u for u in uit if zelfde(u, b)), None)
+            if gelijk is None:
+                b["bron"] = [naam]
+                uit.append(b)
+            else:
+                if naam not in gelijk["bron"]:
+                    gelijk["bron"].append(naam)
+                if ERNST.get(b["ernst"], 3) < ERNST.get(gelijk["ernst"], 3):
+                    gelijk["ernst"] = b["ernst"]
+    return uit
+
+
+# ---------------------------------------------------------------- hoofdprogramma
+
+def main(argv):
+    args, opnieuw, parallel, modus, voorstel, droog = [], False, 2, "diff", None, False
+    titel_eigen = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--alles":
+            modus = "alles"
+        elif a == "--opnieuw":
+            opnieuw = True
+        elif a == "--droog":
+            droog = True
+        elif a == "--parallel" and i + 1 < len(argv):
+            parallel = max(1, int(argv[i + 1]))
+            i += 1
+        elif a == "--samenvoegen":
+            modus = "samenvoegen"
+        elif a == "--titel" and i + 1 < len(argv):
+            titel_eigen = argv[i + 1]
+            i += 1
+        elif a == "--advies" and i + 1 < len(argv):
+            modus, voorstel = "advies", argv[i + 1]
+            i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            args.append(a)
+        i += 1
+
+    os.chdir(git("rev-parse", "--show-toplevel").strip())
+    inst = instellingen()
+    gitmap = os.path.abspath(git("rev-parse", "--git-dir").strip())
+    basis = os.path.join(gitmap, "gemini-review")
+    cache = os.path.join(basis, "cache")
+    bcache = os.path.join(cache, "bestanden")
+    os.makedirs(cache, exist_ok=True)
+    stempel = os.path.join(basis, datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + modus)
+    map_, n = stempel, 1
+    while os.path.exists(map_):         # twee runs in dezelfde seconde
+        n += 1
+        map_ = "%s-%d" % (stempel, n)
+    os.makedirs(map_)
+    afspraken = lees(inst["afspraken"]) if inst["afspraken"] else ""
+
+    if modus == "samenvoegen":
+        bronnen = []
+        for a in args:
+            naam, is_, pad = a.partition("=")
+            if not is_ or not naam or not pad:
+                print("gemini-review: %s: verwacht NAAM=bevindingen.json" % a)
+                return 2
+            try:
+                with open(pad, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as e:
+                print("gemini-review: kan %s niet lezen: %s" % (a, e))
+                return 2
+            bronnen.append((naam, (data.get("bevindingen") or data.get("punten") or [])
+                            if isinstance(data, dict)
+                            else data))
+        if not bronnen:
+            print("gemini-review: geef bronnen als NAAM=bevindingen.json")
+            return 2
+        lijst = samenvoegen(bronnen)
+        meer = sum(1 for b in lijst if len(b["bron"]) > 1)
+        kop = ["Bronnen: %s · %s" % (", ".join("%s (%d)" % (n, len(l)) for n, l in bronnen),
+                                     datetime.datetime.now().strftime("%d-%m-%Y %H:%M")),
+               "Na samenvoegen: %d punten, waarvan %d door meer bronnen gevonden"
+               % (len(lijst), meer)]
+        pad, _ = rapport(map_, titel_eigen or "Samengevoegde review", lijst, kop)
+        print("gemini-review: %d punten (%d door meer bronnen), rapport: %s"
+              % (len(lijst), meer, pad))
+        return 0
+
+    taken = []          # (naam, prompt, schema, paden of None)
+    bekend, ongewijzigd = [], 0     # --alles: bevindingen uit de cache per bestand
+    sleutels = {}                   # --alles: cachesleutel per bestand, bij het begin bepaald
+    if modus == "advies":
+        tekst = lees(voorstel)
+        if tekst is None:
+            print("gemini-review: kan %s niet lezen" % voorstel)
+            return 2
+        code = "".join(genummerd(p, lees(p) or "") for p in args)
+        if len(code.encode()) > MAX_DEEL:
+            print("gemini-review: de meegegeven bestanden zijn samen te groot (max. ~110 KB)")
+            return 2
+        bestanden = [b for b in git("ls-files", "-z", "--", *(inst["paden"] or ["."]))
+                     .split("\0") if b and os.path.isfile(b)]
+        taken.append(("advies", advies_prompt(inst["context"], afspraken, tekst, code,
+                                              overzicht(bestanden)), SCHEMA_ADVIES, None))
+    elif modus == "alles":
+        bestanden = [b for b in git("ls-files", "-z", "--", *(inst["paden"] or ["."]))
+                     .split("\0") if b and os.path.isfile(b)]
+        os.makedirs(bcache, exist_ok=True)
+        nieuw = []
+        for b in bestanden:
+            sleutels[b] = bestand_sleutel(inst["context"], b)
+            cpad = os.path.join(bcache, sleutels[b] + ".json")
+            if os.path.exists(cpad) and not opnieuw:
+                with open(cpad, encoding="utf-8") as f:
+                    bekend += json.load(f)
+                ongewijzigd += 1
+            else:
+                nieuw.append(b)
+        for n, (inhoud, paden) in enumerate(code_delen(nieuw), 1):
+            taken.append(("deel-%02d" % n, review_prompt(inst["context"], inhoud, "code"),
+                          SCHEMA_REVIEW, paden))
+        kaart = overzicht(bestanden)
+        taken.append(("samenhang", samenhang_prompt(inst["context"], afspraken, kaart),
+                      SCHEMA_REVIEW, None))
+    else:
+        if args:
+            diff = git("diff", *args)
+        else:
+            diff = git("diff", "HEAD") if heeft_commit() else git("diff", "--cached")
+            for b in git("ls-files", "--others", "--exclude-standard", "-z").split("\0"):
+                if b:
+                    d = subprocess.run(["git", "diff", "--no-index", "--", "/dev/null", b],
+                                       stdout=subprocess.PIPE)
+                    diff += d.stdout.decode("utf-8", "replace")
+        if not diff.strip():
+            print("gemini-review: geen wijzigingen om te reviewen")
+            return 0
+        for n, inhoud in enumerate(diff_delen(diff), 1):
+            taken.append(("deel-%02d" % n, review_prompt(inst["context"], inhoud, "diff"),
+                          SCHEMA_REVIEW, None))
+
+    if droog:
+        os.rmdir(map_)
+        for n, p, s, _ in taken:
+            print("  %-10s %4d KB" % (n, len(p.encode()) // 1024))
+        print("gemini-review: %d aanroep(en), model %s (droog: niets verstuurd)%s"
+              % (len(taken), MODEL, ", %d bestanden ongewijzigd (uit cache)" % ongewijzigd
+                 if ongewijzigd else ""))
+        return 0
+    print("gemini-review: %d aanroep(en), model %s, map %s%s"
+          % (len(taken), MODEL, map_, "; %d bestanden ongewijzigd (uit cache)" % ongewijzigd
+             if ongewijzigd else ""), flush=True)
+    resultaten, fouten, tokens, uit_cache = list(bekend), [], 0, 0
+    per_bestand, mislukt = {}, set()        # --alles: bevindingen per bestand, voor de cache
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=parallel)
+    lopend = {pool.submit(vraag, p, s, map_, n, cache, opnieuw): (n, paden)
+              for n, p, s, paden in taken}
+    try:
+        for f in concurrent.futures.as_completed(lopend):
+            naam, paden = lopend[f]
+            try:
+                uit, verbruik, gecached = f.result()
+            except Stop as e:
+                GESTOPT.set()
+                print("gemini-review: gestopt, %s" % e)
+                return 3
+            except Exception as e:      # een deel mislukt: de rest gaat door
+                fouten.append("%s: %s" % (naam, e))
+                mislukt |= paden or set()
+                print("  %-10s MISLUKT: %s" % (naam, e), flush=True)
+                continue
+            lijst = uit.get("bevindingen", uit.get("punten", []))
+            if paden:
+                for pad in paden:
+                    per_bestand.setdefault(pad, [])
+                for b in lijst:
+                    b["bestand"] = bij_bestand(b, paden)
+                    per_bestand[b["bestand"]].append(b)
+            resultaten += lijst
+            uit_cache += gecached
+            tokens += 0 if gecached else verbruik.get("total_tokens", 0)
+            print("  %-10s %d punt(en)%s" % (naam, len(lijst), " (uit cache)" if gecached else ""),
+                  flush=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        with SLOT:
+            for p in list(LOPEND):
+                stop_proces(p)
+
+    # Cache per bestand: alleen bestanden waarvan elk deel gelukt is (een groot bestand kan
+    # over meer delen verdeeld zijn).
+    for pad, lijst in per_bestand.items():
+        if pad not in mislukt:
+            with open(os.path.join(bcache, sleutels[pad] + ".json"), "w", encoding="utf-8") as f:
+                json.dump(lijst, f, ensure_ascii=False)
+
+    nu = datetime.datetime.now().strftime("%d-%m-%Y %H:%M")
+    commit = git("rev-parse", "--short", "HEAD").strip() if heeft_commit() else "(geen commit)"
+    kop = ["Model: %s · commit %s · %s" % (MODEL, commit, nu),
+           "Aanroepen: %d (%d uit cache) · tokens deze keer: %d" % (len(taken), uit_cache, tokens)]
+    if ongewijzigd:
+        kop.append("Ongewijzigde bestanden uit de cache: %d" % ongewijzigd)
+    if fouten:
+        kop.append("**Mislukt:** " + "; ".join(fouten))
+    titel = {"advies": "Second opinion van Gemini op %s" % voorstel,
+             "alles": "Review van de hele codebase door Gemini",
+             "diff": "Review van de wijzigingen door Gemini"}[modus]
+    pad, uniek = rapport(map_, titel, resultaten, kop)
+    print("gemini-review: %d punt(en), %d tokens, rapport: %s" % (len(uniek), tokens, pad))
+    if modus != "alles":
+        print()
+        print(lees(pad))
+    return 1 if fouten else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
