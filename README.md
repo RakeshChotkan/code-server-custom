@@ -55,7 +55,8 @@ API-key nodig).
   samenhangronde.
 - **Per repository** een bestand `.gemini-review` met de paden voor `--alles`, een korte
   beschrijving van het project (gaat mee in elke aanroep: kort houden) en het bestand met de
-  afspraken (gaat mee in de samenhangronde en bij `--advies`):
+  afspraken (gaat mee in de samenhangronde en bij `--advies`; meer bestanden mag, gescheiden
+  door spaties, bijvoorbeeld een `CLAUDE.md` per submap):
 
   ```ini
   [review]

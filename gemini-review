@@ -34,7 +34,8 @@ Per repository (optioneel) een bestand .gemini-review:
     [review]
     paden = src tests            ; voor --alles (standaard: alle bestanden in git)
     context = Korte beschrijving van het project en de belangrijkste regels.
-    afspraken = CLAUDE.md        ; voor de samenhangronde en --advies
+    afspraken = CLAUDE.md        ; voor de samenhangronde en --advies; meer bestanden
+                                 ; mag, gescheiden door spaties
 """
 import ast
 import concurrent.futures
@@ -128,6 +129,17 @@ def lees(pad):
             return f.read()
     except (OSError, UnicodeDecodeError):
         return None
+
+
+def lees_afspraken(paden):
+    """De afspraken uit een of meer bestanden (gescheiden door spaties of regeleindes).
+    Bij meer dan één staat de naam van elk bestand erboven; een bestand dat er niet is,
+    wordt overgeslagen."""
+    gevonden = [(pad, lees(pad)) for pad in paden.split()]
+    gevonden = [(pad, tekst) for pad, tekst in gevonden if tekst is not None]
+    if len(gevonden) == 1:
+        return gevonden[0][1]
+    return "\n\n".join("=== %s ===\n%s" % (pad, tekst) for pad, tekst in gevonden)
 
 
 # ---------------------------------------------------------------- delen maken
@@ -497,7 +509,7 @@ def main(argv):
         n += 1
         map_ = "%s-%d" % (stempel, n)
     os.makedirs(map_)
-    afspraken = lees(inst["afspraken"]) if inst["afspraken"] else ""
+    afspraken = lees_afspraken(inst["afspraken"])
 
     if modus == "samenvoegen":
         bronnen = []
