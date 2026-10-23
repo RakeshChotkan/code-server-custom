@@ -2,6 +2,10 @@
 # Het basisimage bouwt als root; de container draait daarna als abc (PUID/PGID).
 FROM lscr.io/linuxserver/code-server:latest
 
+# Claude Code (native) werkt zichzelf bij in ~/.local (op het /config-volume); de link
+# ~/.local/bin/claude wijst steeds naar de nieuwste versie. Zo is "claude" overal te vinden.
+ENV PATH="${PATH}:/config/.local/bin"
+
 # svn en svnadmin (testrepository), gh (testflow en releases), less en script (schermtests),
 # pandoc (de HTML-versie van de documentatie)
 RUN apt-get update \
