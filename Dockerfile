@@ -12,6 +12,20 @@ RUN apt-get update \
 # Testharnas van T-Tool in de systeem-Python, zodat 'bash tests/run_all.sh' meteen werkt
 RUN pip install --break-system-packages --no-cache-dir pyte vermin flake8 coverage
 
+# Node.js 24 LTS voor de website van OBD Chotkan (Next.js), uit de NodeSource-repository.
+# Eerst downloaden: mislukt curl in een pipe, dan zou apt stil de oude nodejs van Ubuntu nemen.
+RUN curl -fsSL -o /tmp/nodesource_setup.sh https://deb.nodesource.com/setup_24.x \
+ && bash /tmp/nodesource_setup.sh \
+ && apt-get install -y --no-install-recommends nodejs \
+ && node --version | grep -q '^v24\.' \
+ && rm -rf /var/lib/apt/lists/* /tmp/nodesource_setup.sh
+
+# Systeembibliotheken voor Playwright met Chromium (screenshots van de website). De browser
+# zelf ('npx playwright install chromium') staat in ~/.cache/ms-playwright op /config en
+# blijft dus bewaard.
+RUN npx -y playwright@1 install-deps chromium \
+ && rm -rf /var/lib/apt/lists/* /root/.npm
+
 # Antigravity CLI (agy), de opvolger van de Gemini CLI: Gemini met het Google AI Pro-abonnement.
 # Het officiële script controleert de SHA512 van de download. Eén keer inloggen met 'agy';
 # de sessie staat in ~/.gemini (op /config, blijft dus bewaard). De wekelijkse build haalt
@@ -27,6 +41,7 @@ COPY --chmod=755 gemini-review /usr/local/bin/gemini-review
 # Controle: faalt de build hier, dan ontbreekt er iets
 RUN python3 -c 'import pyte, coverage, curses' \
  && svn --version --quiet && svnadmin --version --quiet && gh --version \
+ && node --version && npm --version \
  && vermin --version && flake8 --version && pandoc --version | head -1 \
  && HOME=/root agy --version && gemini-review --help > /dev/null \
  && rm -rf /root/.gemini
