@@ -78,3 +78,27 @@ API-key nodig).
 - **Exitcodes:** 0 gelukt, 1 een deel mislukt (staat in het rapport), 2 verkeerde aanroep,
   3 niet ingelogd of quotum op (stopt meteen, ook de lopende aanroepen).
 - Quotum bekijken: `agy -p "/usage"`.
+
+## Claude-sessies terugvinden
+
+`claude-sessies` (Python, alleen de standaardbibliotheek) maakt eerdere Claude Code-sessies doorzoekbaar, ook als ze
+op claude.ai/code gearchiveerd zijn: de transcripten staan gewoon in `~/.claude/projects/` (op `/config`). Alleen
+lezen; bekende geheimen (sleutels, tokens, wachtwoorden) worden in de index en alle uitvoer onleesbaar gemaakt.
+
+| Opdracht | Wat |
+| --- | --- |
+| `claude-sessies lijst [-n 20] [--project woord]` | recente sessies |
+| `claude-sessies zoek <woorden>` | zoeken in vragen, antwoorden en tool-aanroepen (`"zin"`, `woord*`) |
+| `claude-sessies toon <id> [--tools]` / `export <id> [-o x.md]` | chat lezen of als Markdown bewaren |
+| `claude-sessies overdracht <id>` | korte notitie om in een nieuwe sessie verder te gaan |
+| `claude-sessies web [--poort 8765]` | webpagina met lijst, zoeken, lezen en export |
+
+- **Webpagina:** `https://code.chotkan.nl/proxy/8765/`, achter de inlog van code-server (de server luistert alleen
+  op 127.0.0.1). Dienst: `/custom-services.d/svc-claude-sessies` start `/config/bin/claude-sessies.sh`, dat het
+  script uit deze repository draait en het na een crash opnieuw start (log: `/config/claude-sessies/web.log`).
+- **Index:** SQLite met FTS5 in `/config/claude-sessies/index.db`; alleen gewijzigde transcripten worden opnieuw
+  ingelezen (bij elke opdracht, en op de webpagina hooguit elke 30 s).
+- **In Claude Code:** de skill `/sessies` (`~/.claude/skills/sessies/`) zoekt via dit commando en pakt een sessie
+  weer op met de overdrachtsnotitie (`/sessies verder <id>`).
+- **Bewaartermijn:** Claude Code ruimt transcripten op na `cleanupPeriodDays` in `~/.claude/settings.json` (staat op
+  90). Wat langer moet blijven: exporteren als Markdown, buiten git.

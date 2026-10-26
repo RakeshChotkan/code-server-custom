@@ -42,10 +42,15 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | HOME=/root bash -s --
 # voorstel (alleen lezen)
 COPY --chmod=755 gemini-review /usr/local/bin/gemini-review
 
+# claude-sessies (Python, standaardbibliotheek): eerdere Claude Code-sessies doorzoeken, lezen en
+# exporteren; webpagina via code-server op /proxy/8765/ (dienst in /custom-services.d, zie README)
+COPY --chmod=755 claude-sessies /usr/local/bin/claude-sessies
+
 # Controle: faalt de build hier, dan ontbreekt er iets
 RUN python3 -c 'import pyte, coverage, curses' \
  && svn --version --quiet && svnadmin --version --quiet && gh --version \
  && node --version && npm --version \
  && vermin --version && flake8 --version && pandoc --version | head -1 \
  && HOME=/root agy --version && gemini-review --help > /dev/null \
+ && claude-sessies --help > /dev/null \
  && rm -rf /root/.gemini

@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""claude-sessies: Claude Code-sessies terugvinden, doorzoeken, lezen en exporteren.
+
+Leest de transcripten die Claude Code lokaal bewaart (~/.claude/projects/<project>/<sessie>.jsonl), ook
+van sessies die op claude.ai/code gearchiveerd zijn. Alleen lezen: er wordt niets aan de transcripten veranderd.
+
+  claude-sessies lijst [-n 20] [--project woord]   recente sessies
+  claude-sessies zoek <woorden> [-n 15]             zoeken in alle chats (vragen, antwoorden, tool-aanroepen)
+  claude-sessies toon <id> [--tools]                een chat lezen
+  claude-sessies export <id> [-o bestand.md]        chat als Markdown
+  claude-sessies overdracht <id>                    korte notitie om in een nieuwe sessie verder te gaan
+  claude-sessies index                              de zoekindex bijwerken (gebeurt ook vanzelf)
+  claude-sessies web [--poort 8765]                 webpagina (via code-server: /proxy/8765/)
+
+Een <id> mag een begin van het sessie-id zijn (minstens 6 tekens).
+Zoekindex: $CLAUDE_SESSIES_DB (standaard ~/claude-sessies/index.db). Bekende geheimen (sleutels, tokens,
+wachtwoorden) worden in de index en in alle uitvoer onleesbaar gemaakt.
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import shlex
+import sqlite3
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+HOME = Path(os.environ.get("HOME", "/config"))
+PROJECTEN = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude")) / "projects"
+DB = Path(os.environ.get("CLAUDE_SESSIES_DB", HOME / "claude-sessies" / "index.db"))
+INDEX_VERSIE = 4  # ophogen als het parsen verandert: dan wordt alles opnieuw ingelezen
+
+# ── Geheimen ──────────────────────────────────────────────────────────────────────────────────────
+
+GEHEIMEN = [
+    re.compile(r"sk-ant-[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bsb_secret_[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}"),
+    re.compile(r"\bxox[abpr]-[A-Za-z0-9\-]{10,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+]
+# sleutel=waarde of sleutel: waarde, waarbij alleen de waarde verdwijnt
+GEHEIM_VELD = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:password|passwd|wachtwoord|secret|token|api[_-]?key|apikey)[A-Z0-9_]*)"
+    r"([\"']?\s*[:=]\s*[\"']?)([^\s\"',;]{6,})"
+)
+
+
+def verberg(tekst):
+    for p in GEHEIMEN:
+        tekst = p.sub("[verborgen]", tekst)
+    return GEHEIM_VELD.sub(lambda m: f"{m.group(1)}{m.group(2)}[verborgen]", tekst)
+
+
+# ── Transcripten lezen ────────────────────────────────────────────────────────────────────────────
+
+HERINNERING = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+COMMANDO = re.compile(r"<command-name>(.*?)</command-name>.*?(?:<command-args>(.*?)</command-args>)?", re.S)
+INTERNE_TAGS = re.compile(r"</?(?:command-message|command-name|command-args|local-command-stdout)>")
+
+
+def schoon(tekst):
+    tekst = HERINNERING.sub("", tekst)
+    m = COMMANDO.search(tekst)
+    if m and tekst.lstrip().startswith("<command-"):
+        return f"/{m.group(1).lstrip('/')} {(m.group(2) or '').strip()}".strip()
+    return INTERNE_TAGS.sub("", tekst).strip()
+
+
+def regels(pad):
+    """JSON-records van een transcript; halve of kapotte regels (sessie schrijft nog) worden overgeslagen."""
+    try:
+        with open(pad, encoding="utf-8", errors="replace") as f:
+            for regel in f:
+                try:
+                    d = json.loads(regel)
+                except ValueError:
+                    continue
+                if isinstance(d, dict):
+                    yield d
+    except OSError:
+        return
+
+
+def tool_kort(naam, invoer):
+    """Eén regel over een tool-aanroep: wat er gebeurde, zonder de hele inhoud."""
+    invoer = invoer if isinstance(invoer, dict) else {}
+    for sleutel in ("description", "file_path", "command", "pattern", "url", "query", "prompt", "skill"):
+        if invoer.get(sleutel):
+            waarde = str(invoer[sleutel]).strip().splitlines()[0] if str(invoer[sleutel]).strip() else ""
+            return f"{naam}: {waarde[:200]}"
+    return naam
+
+
+def berichten(pad, met_tools=False):
+    """De chat als lijst (rol, tijd, tekst[, extra]); rol is 'jij', 'claude' of 'tool'.
+
+    Bij tools: tekst is de korte regel, extra (alleen met_tools) de invoer en het begin van de uitkomst.
+    """
+    uit = []
+    tools = {}
+    for d in regels(pad):
+        soort = d.get("type")
+        if soort not in ("user", "assistant") or d.get("isSidechain") or d.get("isMeta"):
+            continue
+        tijd = d.get("timestamp", "")
+        inhoud = (d.get("message") or {}).get("content")
+        if soort == "user":
+            if isinstance(inhoud, str):
+                t = schoon(inhoud)
+                if t:
+                    uit.append({"rol": "jij", "tijd": tijd, "tekst": t})
+                continue
+            for blok in inhoud if isinstance(inhoud, list) else []:
+                if not isinstance(blok, dict):
+                    continue
+                if blok.get("type") == "text":
+                    t = schoon(blok.get("text", ""))
+                    if t:
+                        uit.append({"rol": "jij", "tijd": tijd, "tekst": t})
+                elif blok.get("type") == "tool_result" and met_tools and blok.get("tool_use_id") in tools:
+                    res = blok.get("content")
+                    if isinstance(res, list):
+                        res = "\n".join(x.get("text", "") for x in res if isinstance(x, dict) and x.get("type") == "text")
+                    res = str(res or "")
+                    tools[blok["tool_use_id"]]["uitkomst"] = res[:3000] + ("\n… (ingekort)" if len(res) > 3000 else "")
+        else:
+            for blok in inhoud if isinstance(inhoud, list) else []:
+                if not isinstance(blok, dict):
+                    continue
+                if blok.get("type") == "text" and blok.get("text", "").strip():
+                    uit.append({"rol": "claude", "tijd": tijd, "tekst": blok["text"].strip()})
+                elif blok.get("type") == "tool_use":
+                    b = {"rol": "tool", "tijd": tijd, "tekst": tool_kort(blok.get("name", "?"), blok.get("input")),
+                         "naam": blok.get("name", "?"), "invoer": blok.get("input") or {}}
+                    if met_tools:
+                        tools[blok.get("id")] = b
+                    uit.append(b)
+    for b in uit:
+        b["tekst"] = verberg(b["tekst"])
+        if "uitkomst" in b:
+            b["uitkomst"] = verberg(b["uitkomst"])
+    return uit
+
+
+def kenmerken(pad):
+    """Titel, map en tijden van een sessie."""
+    titel = ai_titel = cwd = None
+    start = eind = None
+    for d in regels(pad):
+        soort = d.get("type")
+        if soort == "custom-title" and d.get("customTitle"):
+            titel = d["customTitle"]
+        elif soort == "ai-title" and d.get("aiTitle"):
+            ai_titel = d["aiTitle"]
+        elif soort in ("user", "assistant") and not d.get("isSidechain"):
+            cwd = cwd or d.get("cwd")
+            t = d.get("timestamp")
+            if t:
+                start = start or t
+                eind = t
+    return {"titel": titel or ai_titel, "cwd": cwd, "start": start, "eind": eind}
+
+
+def sessiebestanden():
+    if not PROJECTEN.is_dir():
+        return []
+    uuid = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    return sorted(p for p in PROJECTEN.glob("*/*.jsonl") if uuid.fullmatch(p.stem))
+
+
+# ── Index ─────────────────────────────────────────────────────────────────────────────────────────
+
+def verbind():
+    DB.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    db = sqlite3.connect(DB, timeout=30, check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS sessies (
+            id TEXT PRIMARY KEY, pad TEXT, project TEXT, cwd TEXT, titel TEXT, eerste_vraag TEXT,
+            start TEXT, eind TEXT, vragen INTEGER, mtime REAL, grootte INTEGER, versie INTEGER);
+        CREATE VIRTUAL TABLE IF NOT EXISTS teksten USING fts5(
+            sessie UNINDEXED, nr UNINDEXED, rol UNINDEXED, tijd UNINDEXED, tekst,
+            tokenize = 'unicode61 remove_diacritics 2');
+    """)
+    return db
+
+
+_slot = threading.Lock()
+
+
+def bijwerken(db, stil=True):
+    """Leest alleen gewijzigde transcripten opnieuw in; verdwenen sessies gaan uit de index."""
+    with _slot:
+        if not PROJECTEN.is_dir():  # map (even) niet beschikbaar: index laten staan in plaats van leeg te gooien
+            return 0, 0
+        bekend = {r["id"]: r for r in db.execute("SELECT id, mtime, grootte, versie FROM sessies")}
+        gezien = set()
+        nieuw = 0
+        for pad in sessiebestanden():
+            sid = pad.stem
+            gezien.add(sid)
+            try:
+                st = pad.stat()
+            except OSError:
+                continue
+            r = bekend.get(sid)
+            if r and r["mtime"] == st.st_mtime and r["grootte"] == st.st_size and r["versie"] == INDEX_VERSIE:
+                continue
+            k = kenmerken(pad)
+            lijst = berichten(pad)
+            vragen = [b for b in lijst if b["rol"] == "jij"]
+            eerste = vragen[0]["tekst"] if vragen else ""
+            with db:
+                db.execute("DELETE FROM teksten WHERE sessie = ?", (sid,))
+                db.executemany("INSERT INTO teksten (sessie, nr, rol, tijd, tekst) VALUES (?, ?, ?, ?, ?)",
+                               [(sid, i, b["rol"], b["tijd"], b["tekst"]) for i, b in enumerate(lijst)])
+                db.execute("INSERT OR REPLACE INTO sessies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (sid, str(pad), pad.parent.name, k["cwd"], " ".join(verberg(k["titel"] or eerste[:90]).split()), eerste[:2000],
+                            k["start"], k["eind"], len(vragen), st.st_mtime, st.st_size, INDEX_VERSIE))
+            nieuw += 1
+            if not stil:
+                print(f"  {sid[:8]}  {(k['titel'] or eerste)[:70]}", file=sys.stderr)
+        weg = set(bekend) - gezien
+        with db:
+            for sid in weg:
+                db.execute("DELETE FROM sessies WHERE id = ?", (sid,))
+                db.execute("DELETE FROM teksten WHERE sessie = ?", (sid,))
+        return nieuw, len(weg)
+
+
+def zoekvraag(woorden):
+    """Gewone woorden naar een FTS5-vraag: alle woorden moeten voorkomen; "zin tussen aanhalingstekens" als geheel,
+    woord* voor alles wat zo begint."""
+    uit = []
+    for w in re.findall(r'"[^"]+"|[^\s"]+', woorden):
+        if w.startswith('"'):
+            uit.append(w)
+        else:
+            ster = w.endswith("*")
+            w = w.strip("*")
+            if w:
+                uit.append(f'"{w}"' + ("*" if ster else ""))
+    return " ".join(uit)
+
+
+def zoek(db, woorden, limiet=50, project=None):
+    vraag = zoekvraag(woorden)
+    if not vraag:
+        return []
+    sql = """SELECT t.sessie, t.nr, t.rol, t.tijd, snippet(teksten, 4, '\x02', '\x03', ' … ', 18) AS stuk,
+                    s.titel, s.project, s.eind
+             FROM teksten t JOIN sessies s ON s.id = t.sessie
+             WHERE teksten MATCH ?""" + (" AND s.project LIKE ?" if project else "") + """
+             ORDER BY s.eind DESC, t.nr LIMIT ?"""
+    args = [vraag] + ([f"%{project}%"] if project else []) + [limiet]
+    try:
+        return list(db.execute(sql, args))
+    except sqlite3.OperationalError:
+        return []
+
+
+def sessies(db, limiet=50, project=None):
+    sql = "SELECT * FROM sessies" + (" WHERE project LIKE ? OR cwd LIKE ?" if project else "") + " ORDER BY eind DESC LIMIT ?"
+    args = ([f"%{project}%"] * 2 if project else []) + [limiet]
+    return list(db.execute(sql, args))
+
+
+def vind(db, deel):
+    if len(deel) < 6:
+        sys.exit("Geef minstens 6 tekens van het sessie-id.")
+    rijen = list(db.execute("SELECT * FROM sessies WHERE id LIKE ? ORDER BY eind DESC", (deel + "%",)))
+    if not rijen:
+        sys.exit(f"Geen sessie gevonden voor '{deel}' (geef minstens 6 tekens van het id).")
+    if len(rijen) > 1:
+        sys.exit(f"'{deel}' past bij {len(rijen)} sessies; geef meer tekens.")
+    return rijen[0]
+
+
+# ── Weergave ──────────────────────────────────────────────────────────────────────────────────────
+
+def tijdstip(iso, lang=False):
+    if not iso:
+        return ""
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return iso
+    return t.strftime("%d-%m-%Y %H:%M" if lang else "%d-%m %H:%M")
+
+
+def project_naam(rij):
+    return (rij["cwd"] or rij["project"] or "").replace("/ai/workspace/", "").replace("/ai/workspace", "workspace") or "?"
+
+
+def markdown(rij, met_tools=True):
+    lijst = berichten(rij["pad"], met_tools=met_tools)
+    uit = [f"# {rij['titel'] or 'Sessie'}", "",
+           f"- Sessie: `{rij['id']}`", f"- Map: `{rij['cwd'] or rij['project']}`",
+           f"- Van {tijdstip(rij['start'], True)} tot {tijdstip(rij['eind'], True)}", ""]
+    for b in lijst:
+        if b["rol"] == "tool":
+            if met_tools:
+                uit.append(f"> 🔧 {b['tekst']}")
+                uit.append("")
+            continue
+        kop = "## Jij" if b["rol"] == "jij" else "## Claude"
+        uit += [f"{kop} · {tijdstip(b['tijd'])}", "", b["tekst"], ""]
+    return "\n".join(uit)
+
+
+def overdracht(rij):
+    """Korte notitie om in een nieuwe sessie verder te gaan: geen hele chat, wel de draad."""
+    lijst = berichten(rij["pad"])
+    vragen = [b for b in lijst if b["rol"] == "jij"]
+    antwoorden = [b for b in lijst if b["rol"] == "claude"]
+    bestanden, commits = [], []
+    for b in lijst:
+        if b["rol"] != "tool":
+            continue
+        inv = b.get("invoer") or {}
+        if b["naam"] in ("Edit", "Write", "MultiEdit", "NotebookEdit") and inv.get("file_path"):
+            if inv["file_path"] not in bestanden:
+                bestanden.append(inv["file_path"])
+        if b["naam"] == "Bash" and "git commit" in str(inv.get("command", "")):
+            m = re.search(r"-m\s+(?:\"\$\(cat <<'?EOF'?\n)?[\"']?([^\n\"']+)", inv["command"])
+            if m:
+                commits.append(m.group(1).strip())
+
+    def kort(t, n):
+        t = t.strip()
+        return t if len(t) <= n else t[:n].rstrip() + " …"
+
+    uit = [f"# Overdracht: {rij['titel'] or 'sessie'}", "",
+           f"Vorige sessie `{rij['id']}` in `{rij['cwd'] or rij['project']}`, "
+           f"{tijdstip(rij['start'], True)} tot {tijdstip(rij['eind'], True)}, {len(vragen)} vragen.",
+           f"Volledige chat: `claude-sessies toon {rij['id'][:8]}`; hervatten in een terminal: "
+           f"`cd {shlex.quote(rij['cwd'] or '.')} && claude --resume {rij['id']}`.", "",
+           "## Waar het om begon", "", kort(vragen[0]["tekst"], 1500) if vragen else "(geen vraag)", ""]
+    if len(vragen) > 1:
+        uit += ["## Laatste vragen", ""] + [f"- {tijdstip(b['tijd'])}: {kort(b['tekst'], 400)}" for b in vragen[-4:]] + [""]
+    if bestanden:
+        uit += ["## Gewijzigde bestanden", ""] + [f"- `{p}`" for p in bestanden[-40:]] + [""]
+    if commits:
+        uit += ["## Commits", ""] + [f"- {c}" for c in commits[-15:]] + [""]
+    if antwoorden:
+        uit += ["## Laatste antwoord van Claude", "", kort(antwoorden[-1]["tekst"], 3000), ""]
+    return "\n".join(uit)
+
+
+# ── Webpagina ─────────────────────────────────────────────────────────────────────────────────────
+
+CSS = """
+:root{--bg:#f6f5f2;--kaart:#fff;--tekst:#16161a;--zacht:#6b6a72;--rand:#e3e1dc;--accent:#d9590a;--jij:#fff4ea;--tool:#f0efeb;--mark:#ffe1c4}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0b0f;--kaart:#141419;--tekst:#f2f0eb;--zacht:#a8a6af;--rand:#2a2a32;--accent:#ff7a1a;--jij:#24170d;--tool:#1b1b21;--mark:#5a2a08}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tekst);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:980px;margin:0 auto;padding:20px 16px 80px}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:18px}
+h1{font-size:22px;margin:0;letter-spacing:-.02em}h1 small{color:var(--zacht);font-weight:400;font-size:14px}
+form.zoek{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+form.zoek input{flex:1 1 240px;min-width:0;padding:11px 14px;border:1px solid var(--rand);border-radius:10px;background:var(--kaart);color:var(--tekst);font-size:16px}
+form.zoek select,button,.knop{padding:10px 14px;border:1px solid var(--rand);border-radius:10px;background:var(--kaart);color:var(--tekst);font-size:14px;cursor:pointer}
+.knop.hoofd{background:var(--accent);border-color:var(--accent);color:#fff}
+.lijst{display:grid;gap:8px}
+.sessie{display:block;padding:12px 14px;border:1px solid var(--rand);border-radius:12px;background:var(--kaart);color:var(--tekst)}
+.sessie:hover{border-color:var(--accent);text-decoration:none}
+.sessie b{display:block;font-size:15px}.meta{color:var(--zacht);font-size:13px;font-family:ui-monospace,monospace}
+.stuk{margin-top:6px;font-size:13.5px;color:var(--zacht)}mark{background:var(--mark);color:inherit;border-radius:3px;padding:0 2px}
+.bericht{margin:12px 0;padding:12px 16px;border-radius:14px;border:1px solid var(--rand);background:var(--kaart);overflow-wrap:anywhere}
+.bericht.jij{background:var(--jij)}.bericht .wie{font-size:12px;color:var(--zacht);font-family:ui-monospace,monospace;margin-bottom:4px}
+.bericht pre,.bericht code{font-family:ui-monospace,monospace;font-size:13px}
+.bericht pre{white-space:pre-wrap;background:var(--tool);padding:10px;border-radius:8px;overflow-x:auto}
+.tekst{white-space:pre-wrap}
+details.tool{margin:4px 0 4px 14px;font-size:13px;color:var(--zacht)}details.tool summary{cursor:pointer;font-family:ui-monospace,monospace}
+details.tool pre{white-space:pre-wrap;background:var(--tool);padding:8px;border-radius:8px;max-height:420px;overflow:auto;color:var(--tekst)}
+.balk{position:sticky;top:0;z-index:2;display:flex;flex-wrap:wrap;gap:8px;padding:10px 0;background:var(--bg);border-bottom:1px solid var(--rand);margin-bottom:8px}
+.doel{outline:2px solid var(--accent)}
+.leeg{color:var(--zacht);padding:30px 0;text-align:center}
+"""
+
+JS = """
+function kopieer(t,k){navigator.clipboard.writeText(t).then(()=>{const o=k.textContent;k.textContent='Gekopieerd ✓';setTimeout(()=>k.textContent=o,1500)})}
+const h=location.hash&&document.querySelector(location.hash);if(h){h.classList.add('doel');h.scrollIntoView({block:'center'})}
+"""
+
+
+def e(t):
+    return html.escape(str(t or ""), quote=True)
+
+
+def stuk_html(stuk):
+    return e(stuk).replace("\x02", "<mark>").replace("\x03", "</mark>")
+
+
+def tekst_html(t):
+    """Eenvoudige Markdown: codeblokken en `code`; de rest als platte tekst met behouden regels."""
+    delen = re.split(r"```[^\n]*\n(.*?)```", t, flags=re.S)
+    uit = []
+    for i, deel in enumerate(delen):
+        if i % 2:
+            uit.append(f"<pre>{e(deel)}</pre>")
+        else:
+            s = e(deel)
+            s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)
+            s = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", s)
+            uit.append(f'<div class="tekst">{s}</div>')
+    return "".join(uit)
+
+
+def pagina(titel, inhoud):
+    return f"""<!doctype html><html lang="nl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(titel)}</title>
+<style>{CSS}</style></head><body><div class="wrap">{inhoud}</div><script>{JS}</script></body></html>"""
+
+
+def web_lijst(db, q, project):
+    projecten = [r[0] for r in db.execute("SELECT DISTINCT cwd FROM sessies WHERE cwd IS NOT NULL ORDER BY cwd")]
+    keuze = "".join(f'<option value="{e(p)}"{" selected" if p == project else ""}>{e(p.replace("/ai/workspace/", ""))}</option>'
+                    for p in projecten)
+    aantal = db.execute("SELECT COUNT(*) FROM sessies").fetchone()[0]
+    kop = (f'<header><h1>Claude-sessies <small>{aantal} bewaard</small></h1></header>'
+           f'<form class="zoek" method="get" action="./"><input name="q" value="{e(q)}" placeholder="Zoek in alle chats… (bv. supabase migratie)" autofocus>'
+           f'<select name="project"><option value="">Alle mappen</option>{keuze}</select><button class="knop hoofd">Zoek</button></form>')
+    if q:
+        treffers = zoek(db, q, 300, project or None)
+        if not treffers:
+            return pagina(f"Zoeken: {q}", kop + '<p class="leeg">Niets gevonden.</p>')
+        groepen = {}
+        for t in treffers:
+            groepen.setdefault(t["sessie"], []).append(t)
+        blokken = []
+        for sid, ts in groepen.items():
+            t0 = ts[0]
+            stukken = "".join(f'<div class="stuk"><a href="s/{e(sid)}#m{t["nr"]}">{e(t["rol"])} · {e(tijdstip(t["tijd"]))}</a> {stuk_html(t["stuk"])}</div>'
+                              for t in ts[:4])
+            meer = f'<div class="meta">+ {len(ts) - 4} treffers meer</div>' if len(ts) > 4 else ""
+            blokken.append(f'<div class="sessie"><a href="s/{e(sid)}"><b>{e(t0["titel"] or "Sessie zonder titel")}</b></a>'
+                           f'<span class="meta">{e(tijdstip(t0["eind"], True))} · {len(ts)} treffers</span>{stukken}{meer}</div>')
+        return pagina(f"Zoeken: {q}", kop + f'<div class="lijst">{"".join(blokken)}</div>')
+    rijen = sessies(db, 500, project or None)
+    items = "".join(f'<a class="sessie" href="s/{e(r["id"])}"><b>{e(r["titel"] or "Sessie zonder titel")}</b>'
+                    f'<span class="meta">{e(tijdstip(r["eind"], True))} · {e(project_naam(r))} · {r["vragen"]} vragen · {e(r["id"][:8])}</span></a>'
+                    for r in rijen)
+    return pagina("Claude-sessies", kop + f'<div class="lijst">{items or "<p class=leeg>Nog geen sessies.</p>"}</div>')
+
+
+def web_sessie(rij):
+    lijst = berichten(rij["pad"], met_tools=True)
+    hervat = f"cd {shlex.quote(rij['cwd'] or '.')} && claude --resume {rij['id']}"
+    balk = (f'<div class="balk"><a class="knop" href="../">← Alle sessies</a>'
+            f'<a class="knop" href="{e(rij["id"])}.md">Exporteer (Markdown)</a>'
+            f'<a class="knop hoofd" href="{e(rij["id"])}.overdracht">Overdrachtsnotitie</a>'
+            f'<button class="knop" onclick="kopieer({e(json.dumps(hervat))},this)">Kopieer hervat-opdracht</button>'
+            f'<button class="knop" onclick="kopieer({e(json.dumps(f"/sessies verder {rij["id"][:8]}"))},this)">Kopieer /sessies-opdracht</button></div>')
+    kop = (f'<header><h1>{e(rij["titel"])}</h1></header><p class="meta">{e(rij["id"])} · {e(rij["cwd"] or rij["project"])} · '
+           f'{e(tijdstip(rij["start"], True))} – {e(tijdstip(rij["eind"], True))}</p>')
+    delen = []
+    for i, b in enumerate(lijst):
+        if b["rol"] == "tool":
+            inv = verberg(json.dumps(b.get("invoer"), ensure_ascii=False, indent=1))[:4000]
+            delen.append(f'<details class="tool" id="m{i}"><summary>🔧 {e(b["tekst"])}</summary><pre>{e(inv)}</pre>'
+                         + (f'<pre>{e(b["uitkomst"])}</pre>' if b.get("uitkomst") else "") + "</details>")
+        else:
+            wie = "Jij" if b["rol"] == "jij" else "Claude"
+            delen.append(f'<div class="bericht {b["rol"]}" id="m{i}"><div class="wie">{wie} · {e(tijdstip(b["tijd"]))}</div>{tekst_html(b["tekst"])}</div>')
+    return pagina(rij["titel"] or "Sessie", kop + balk + "".join(delen))
+
+
+def web(poort, adres):
+    db = verbind()
+    laatste = [0.0]
+    verzoek = threading.Lock()  # één verbinding voor alle threads: verzoeken na elkaar afhandelen
+
+    def vers():
+        if time.time() - laatste[0] > 30:
+            laatste[0] = time.time()
+            bijwerken(db)
+
+    class Handler(BaseHTTPRequestHandler):
+        def stuur(self, code, inhoud, soort="text/html; charset=utf-8", extra=None):
+            data = inhoud.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", soort)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Robots-Tag", "noindex")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            with verzoek:
+                self.afhandelen()
+
+        def afhandelen(self):
+            url = urlparse(self.path)
+            pad = unquote(url.path)
+            qs = parse_qs(url.query)
+            try:
+                vers()
+                if pad in ("/", ""):
+                    return self.stuur(200, web_lijst(db, qs.get("q", [""])[0].strip(), qs.get("project", [""])[0]))
+                m = re.fullmatch(r"/s/([0-9a-f-]{6,})(\.md|\.overdracht)?", pad)
+                if m:
+                    rijen = list(db.execute("SELECT * FROM sessies WHERE id LIKE ? LIMIT 2", (m.group(1) + "%",)))
+                    if len(rijen) != 1:
+                        return self.stuur(404, pagina("Niet gevonden", '<p class="leeg">Sessie niet gevonden. <a href="../">Terug</a></p>'))
+                    rij = rijen[0]
+                    if m.group(2) == ".md":
+                        naam = re.sub(r"[^\w\- ]", "", rij["titel"] or "sessie")[:60].strip() or "sessie"
+                        return self.stuur(200, markdown(rij), "text/markdown; charset=utf-8",
+                                          {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(naam)}-{rij['id'][:8]}.md"})
+                    if m.group(2) == ".overdracht":
+                        return self.stuur(200, overdracht(rij), "text/plain; charset=utf-8")
+                    return self.stuur(200, web_sessie(rij))
+                self.stuur(404, pagina("Niet gevonden", '<p class="leeg">Niet gevonden.</p>'))
+            except Exception as fout:  # de pagina mag nooit omvallen door één raar transcript
+                self.stuur(500, pagina("Fout", f'<p class="leeg">Er ging iets mis: {e(fout)}</p>'))
+
+        def log_message(self, *args):
+            pass
+
+    print(f"claude-sessies: http://{adres}:{poort}/ (via code-server: /proxy/{poort}/)", file=sys.stderr)
+    ThreadingHTTPServer((adres, poort), Handler).serve_forever()
+
+
+# ── Opdrachtregel ─────────────────────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(prog="claude-sessies", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="opdracht", required=True)
+    a = sub.add_parser("lijst", help="recente sessies")
+    a.add_argument("-n", type=int, default=20)
+    a.add_argument("--project")
+    a = sub.add_parser("zoek", help="zoeken in alle chats")
+    a.add_argument("woorden", nargs="+")
+    a.add_argument("-n", type=int, default=15)
+    a.add_argument("--project")
+    a = sub.add_parser("toon", help="een chat lezen")
+    a.add_argument("id")
+    a.add_argument("--tools", action="store_true", help="ook de tool-aanroepen tonen")
+    a = sub.add_parser("export", help="chat als Markdown")
+    a.add_argument("id")
+    a.add_argument("-o", "--uit")
+    a = sub.add_parser("overdracht", help="korte notitie om verder te gaan")
+    a.add_argument("id")
+    sub.add_parser("index", help="zoekindex bijwerken")
+    a = sub.add_parser("web", help="webpagina starten")
+    a.add_argument("--poort", type=int, default=8765)
+    a.add_argument("--adres", default="127.0.0.1")
+    args = p.parse_args()
+
+    if args.opdracht == "web":
+        return web(args.poort, args.adres)
+    db = verbind()
+    if args.opdracht == "index":
+        nieuw, weg = bijwerken(db, stil=False)
+        print(f"{nieuw} sessie(s) ingelezen, {weg} verwijderd; index: {DB}")
+        return
+    bijwerken(db)
+    if args.opdracht == "lijst":
+        for r in sessies(db, args.n, args.project):
+            print(f"{r['id'][:8]}  {tijdstip(r['eind'])}  {project_naam(r)[:24]:24}  {r['vragen']:4} vr  {r['titel'][:80] if r['titel'] else ''}")
+    elif args.opdracht == "zoek":
+        treffers = zoek(db, " ".join(args.woorden), 400, args.project)
+        if not treffers:
+            print("Niets gevonden.")
+        groepen = {}
+        for t in treffers:
+            groepen.setdefault(t["sessie"], []).append(t)
+        for sid, ts in list(groepen.items())[:args.n]:
+            print(f"\n{sid[:8]}  {tijdstip(ts[0]['eind'])}  {ts[0]['titel'][:80]}  ({len(ts)} treffers)")
+            for t in ts[:3]:
+                print(f"    #{t['nr']} {t['rol']}: " + t["stuk"].replace("\x02", "»").replace("\x03", "«").replace("\n", " ")[:220])
+    elif args.opdracht == "toon":
+        print(markdown(vind(db, args.id), met_tools=args.tools))
+    elif args.opdracht == "export":
+        tekst = markdown(vind(db, args.id))
+        if args.uit:
+            Path(args.uit).write_text(tekst, encoding="utf-8")
+            print(f"Geschreven: {args.uit}")
+        else:
+            print(tekst)
+    elif args.opdracht == "overdracht":
+        print(overdracht(vind(db, args.id)))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass
