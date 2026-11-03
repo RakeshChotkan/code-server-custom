@@ -56,6 +56,13 @@ API-key nodig).
   (`.git/gemini-review/cache/bestanden`; de sleutel bevat het pad, de inhoud, het model en
   de prompt). Na één gewijzigd bestand kost een volledige review dus één aanroep plus de
   samenhangronde.
+- **Kaart van de code** (samenhangronde en `--advies`): per bestand de lokale imports en de
+  functies en klassen met parameters en regelnummer, voor Python, TypeScript/JavaScript (met
+  `"use client"`/`"use server"` en doorgegeven exports) en shell, plus de tabellen en functies
+  die SQL-migraties aanmaken. Past de kaart niet in de prompt, dan wordt hij stap voor stap kleiner
+  (zonder SQL, zonder parameters, zonder imports, alleen namen, afgekapt). Zonder kaart (een taal
+  die het script niet kent) slaat `--alles` de samenhangronde over. Gemini mag bestanden uit de
+  kaart lezen met het volledige pad, nooit iets in `.git`.
 - **Per repository** een bestand `.gemini-review` met de paden voor `--alles`, een korte
   beschrijving van het project (gaat mee in elke aanroep: kort houden) en het bestand met de
   afspraken (gaat mee in de samenhangronde en bij `--advies`; meer bestanden mag, gescheiden

@@ -230,36 +230,177 @@ def bij_bestand(b, paden):
     return sorted(paden)[0]
 
 
-def overzicht(bestanden):
-    """Compacte kaart van de code voor de samenhangronde: per bestand de imports en de
-    functies/klassen met hun parameters (Python), of de functies (shell)."""
-    regels = []
-    for pad in bestanden:
-        tekst = lees(pad)
-        if not tekst:
-            continue
-        if pad.endswith(".py") or tekst.startswith("#!/usr/bin/env python"):
-            try:
-                boom = ast.parse(tekst)
-            except SyntaxError:
-                continue
-            imp, defs = [], []
-            for n in boom.body:
-                if isinstance(n, ast.Import):
-                    imp += [a.name for a in n.names]
-                elif isinstance(n, ast.ImportFrom):
-                    imp.append("%s%s" % ("." * n.level, n.module or ""))
-                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    if isinstance(n, ast.ClassDef):
-                        defs.append("class %s" % n.name)
-                    else:
-                        defs.append("%s(%s):%d" % (n.name, ", ".join(a.arg for a in n.args.args),
-                                                   n.lineno))
-            regels.append("%s | import %s | %s" % (pad, ", ".join(imp), "; ".join(defs)))
-        elif tekst.startswith("#!") and "sh" in tekst.split("\n", 1)[0]:
-            fn = re.findall(r"(?m)^\s*([A-Za-z_][\w-]*)\s*\(\)\s*\{", tekst)
-            regels.append("%s | shell | %s" % (pad, "; ".join(fn)))
-    return "\n".join(regels)
+JS_EXT = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+JS_OVERSLAAN = (".d.ts", ".min.js", ".bundle.js")
+JS_IMPORT = re.compile(r"""^\s*(?:import|export)\s+(?:type\s+)?(?:[^;'"]*?\s+from\s+)?["']([^"']+)["']""", re.M)
+JS_DYNAMISCH = re.compile(r"""\bimport\(\s*["']([^"']+)["']\s*\)""")
+JS_FUNCTIE = re.compile(r"^export\s+(?:default\s+)?(?:async\s+)?function\s*\*?\s*(\w*)\s*(?:<[^>()]*>)?\s*\(", re.M)
+JS_CONST = re.compile(r"^export\s+(?:const|let|var)\s+(\w+)\s*(?::[^=\n]+)?=\s*", re.M)
+JS_FUNCTIEWAARDE = re.compile(r"(?:[\w.]+\s*(?:<[^>()]*>)?\(\s*)?(?:async\s+)?(?:function\s*\w*\s*)?(?:<[^>()]*>\s*)?(\(|\w+\s*=>)")
+JS_KLASSE = re.compile(r"^export\s+(?:default\s+)?(?:abstract\s+)?class\s+(\w+)", re.M)
+JS_DOORGEVEN = re.compile(r"""^export\s+(?:type\s+)?(\*(?:\s+as\s+\w+)?|\{[^}]*\})\s*from\s*["']([^"']+)["']""", re.M)
+JS_MARKERING = re.compile(r"""(?:\s|//[^\n]*\n|/\*.*?\*/)*["']use (client|server)["']""", re.S)
+SQL_NAAM = re.compile(r"(?i)\bcreate\s+(?:or\s+replace\s+)?(?:table|function|view)\s+(?:if\s+not\s+exists\s+)?([\w.\"]+)")
+
+
+def lokaal(spec):
+    return spec.startswith(("./", "../", "@/", "~/"))
+
+
+def js_parameters(tekst, start):
+    """De parameterlijst vanaf het '(' op `start`: alleen de namen als dat lukt, anders de
+    ruwe tekst ingekort (types, standaardwaarden en destructuring niet echt ontleed)."""
+    def stap(diepte, tekst, i):
+        # '>' van '=>' (functietype, arrowfunctie) sluit niets; de diepte zakt nooit onder nul
+        if tekst[i] in "([{<":
+            return diepte + 1
+        if tekst[i] in ")]}" or (tekst[i] == ">" and tekst[i - 1:i] != "="):
+            return max(0, diepte - 1)
+        return diepte
+    diepte, i = 0, start
+    while i < len(tekst) and i < start + 600:
+        diepte = stap(diepte, tekst, i)
+        if diepte == 0:
+            break
+        i += 1
+    binnen = re.sub(r"\s+", " ", tekst[start + 1:i]).strip()
+    delen, diepte, stuk = [], 0, ""
+    for j, c in enumerate(binnen):
+        diepte = stap(diepte, binnen, j)
+        if c == "," and diepte == 0:
+            delen.append(stuk)
+            stuk = ""
+        else:
+            stuk += c
+    if stuk.strip():
+        delen.append(stuk)
+    namen = []
+    for d in delen:
+        d = d.strip().lstrip(".")
+        if d[:1] in "{[":
+            namen.append(d[0] + "…" + {"{": "}", "[": "]"}[d[0]])
+        else:
+            namen.append(re.split(r"[?:=]", d, 1)[0].strip())
+    uit = ", ".join(n for n in namen if n)
+    return (uit if all(re.fullmatch(r"\w+|\{…\}|\[…\]", n) for n in namen if n) else binnen)[:60]
+
+
+def kaart_regel(pad, tekst):
+    """Eén bestand als tussenstructuur voor de kaart, of None (niet ondersteund of leeg)."""
+    if pad.endswith(".py") or tekst.startswith("#!/usr/bin/env python"):
+        try:
+            boom = ast.parse(tekst)
+        except SyntaxError:
+            return None
+        imp, defs = [], []
+        for n in boom.body:
+            if isinstance(n, ast.Import):
+                imp += [a.name for a in n.names]
+            elif isinstance(n, ast.ImportFrom):
+                imp.append("%s%s" % ("." * n.level, n.module or ""))
+            elif isinstance(n, ast.ClassDef):
+                defs.append(("class " + n.name, None, None))
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defs.append((n.name, ", ".join(a.arg for a in n.args.args), n.lineno))
+        return {"pad": pad, "soort": "py", "imports": imp, "defs": defs}
+    if tekst.startswith("#!") and "sh" in tekst.split("\n", 1)[0]:
+        fn = re.findall(r"(?m)^\s*([A-Za-z_][\w-]*)\s*\(\)\s*\{", tekst)
+        return {"pad": pad, "soort": "sh", "defs": fn}
+    if pad.endswith(JS_EXT) and not pad.endswith(JS_OVERSLAAN):
+        if any(len(r) > 3000 for r in tekst.splitlines()):
+            return None                 # gegenereerd of geminificeerd
+        regel = lambda pos: tekst.count("\n", 0, pos) + 1
+        imp = [s for s in JS_IMPORT.findall(tekst) + JS_DYNAMISCH.findall(tekst) if lokaal(s)]
+        defs = []
+        for m in JS_FUNCTIE.finditer(tekst):
+            defs.append((m.group(1) or "default", js_parameters(tekst, m.end() - 1), regel(m.start())))
+        for m in JS_CONST.finditer(tekst):
+            w = JS_FUNCTIEWAARDE.match(tekst, m.end())
+            if w and w.group(1) == "(":
+                defs.append((m.group(1), js_parameters(tekst, w.end() - 1), regel(m.start())))
+            elif w:
+                defs.append((m.group(1), re.split(r"\s*=>", w.group(1))[0], regel(m.start())))
+            else:
+                defs.append((m.group(1), None, regel(m.start())))
+        for m in JS_KLASSE.finditer(tekst):
+            defs.append(("class " + m.group(1), None, regel(m.start())))
+        for m in JS_DOORGEVEN.finditer(tekst):
+            if lokaal(m.group(2)):
+                imp.append(m.group(2))
+            namen = m.group(1) if m.group(1).startswith("*") else ", ".join(
+                x.strip().split(" as ")[-1] for x in m.group(1).strip("{}").split(",") if x.strip())
+            defs.append(("doorgegeven: " + namen, None, regel(m.start())))
+        defs.sort(key=lambda d: d[2] or 0)
+        markering = JS_MARKERING.match(tekst[:3000])
+        if not imp and not defs:
+            return None
+        return {"pad": pad, "soort": "js", "imports": list(dict.fromkeys(imp)), "defs": defs,
+                "markering": markering.group(1) if markering else None}
+    if pad.endswith(".sql"):
+        namen = list(dict.fromkeys(n.strip('"') for n in SQL_NAAM.findall(tekst)))
+        return {"pad": pad, "soort": "sql", "defs": namen} if namen else None
+    return None
+
+
+def kaart_tekst(r, niveau):
+    """Niveau 0 = alles; 1 = zonder parameters; 2 = ook zonder imports; 3 = alleen de namen."""
+    if r["soort"] == "sh":
+        return "%s | shell | %s" % (r["pad"], "; ".join(r["defs"]))
+    if r["soort"] == "sql":
+        return "%s | sql | %s" % (r["pad"], ", ".join(r["defs"]))
+
+    def d(naam, params, regel):
+        if params is None or niveau >= 1:
+            tekst = naam
+        else:
+            tekst = "%s(%s)" % (naam, params)
+        return tekst if regel is None or niveau >= 3 else "%s:%d" % (tekst, regel)
+    if r["soort"] == "py" and niveau == 0:
+        # Ongewijzigd ten opzichte van de eerdere kaart (Python): klassen zonder regelnummer
+        defs = [n if n.startswith("class ") else "%s(%s):%d" % (n, p, rg)
+                for n, p, rg in r["defs"]]
+        return "%s | import %s | %s" % (r["pad"], ", ".join(r["imports"]), "; ".join(defs))
+    kop = r["pad"] + (" [%s]" % r["markering"] if r.get("markering") else "")
+    defs = "; ".join(d(*x) for x in r["defs"])
+    if niveau >= 2:
+        return "%s | %s" % (kop, defs)
+    return "%s | import %s | %s" % (kop, ", ".join(r["imports"]), defs)
+
+
+def overzicht(bestanden, budget=None):
+    """Compacte kaart van de code voor de samenhangronde en --advies: per bestand de lokale
+    imports en de functies/klassen met hun parameters en regelnummer (Python, TypeScript en
+    JavaScript), de functies (shell) of de tabellen en functies die een migratie aanmaakt (SQL).
+    Met een budget (bytes) wordt de kaart zo nodig kleiner: eerst zonder SQL, dan zonder
+    parameters, zonder imports, alleen namen, en als laatste afgekapt."""
+    regels = [r for r in (kaart_regel(p, lees(p) or "") for p in bestanden) if r]
+    if not regels:
+        return ""
+    # SQL alleen weglaten als er ook andere bestanden zijn (anders blijft er geen kaart over)
+    zonder_sql = [r for r in regels if r["soort"] != "sql"] or regels
+    stappen = [(regels, 0)] + ([(zonder_sql, 0)] if len(zonder_sql) < len(regels) else [])
+    stappen += [(zonder_sql, n) for n in (1, 2, 3)]
+    for lijst, niveau in stappen:
+        kaart = "\n".join(kaart_tekst(r, niveau) for r in lijst)
+        if budget is None or len(kaart.encode()) <= budget:
+            return kaart
+    uit, maat = [], 0
+    for i, r in enumerate(zonder_sql):
+        regel = kaart_tekst(r, 3)
+        if maat + len(regel.encode()) + 60 > budget:
+            uit.append("(… %d bestanden weggelaten)" % (len(zonder_sql) - i))
+            break
+        uit.append(regel)
+        maat += len(regel.encode()) + 1
+    return "\n".join(uit)
+
+
+def met_kaart(maak, bestanden, marge=2000):
+    """Prompt met een kaart die er nog in past: `maak(kaart)` geeft de prompt; het budget is
+    MAX_PROMPT min de rest van de prompt min een marge. Geeft (prompt, kaart)."""
+    budget = MAX_PROMPT - len(maak("").encode()) - marge
+    kaart = overzicht(bestanden, budget) if budget > 1000 else ""
+    return maak(kaart), kaart
 
 
 # ---------------------------------------------------------------- Gemini aanroepen
@@ -364,10 +505,12 @@ def samenhang_prompt(context, afspraken, kaart):
             "zelf zijn al los gereviewd. Zoek nu alleen naar problemen tussen modules: "
             "verkeerde of inconsistente aanroepen, dubbele logica die uit elkaar kan lopen, "
             "afspraken die op de ene plek wel en op de andere niet gevolgd worden, en zwakke "
-            "plekken in de opbouw. Je mag een bestand lezen (read_file) als je een vermoeden "
-            "moet controleren, maar doe dat spaarzaam; voer geen opdrachten uit.\n\n"
+            "plekken in de opbouw. Je mag een bestand uit de kaart lezen (read_file) als je een "
+            "vermoeden moet controleren, maar doe dat spaarzaam: altijd met het volledige pad "
+            "%s/<pad uit de kaart>, alleen bestanden die in de kaart staan en nooit iets in .git; "
+            "voer geen opdrachten uit.\n\n"
             "Project: %s\n\n%s\n\n--- Afspraken ---\n%s\n\n--- Kaart ---\n%s"
-            % (context, REGELS.replace("Gebruik geen tools en voer niets uit: alles wat je\n"
+            % (os.getcwd(), context, REGELS.replace("Gebruik geen tools en voer niets uit: alles wat je\n"
                                        "nodig hebt staat in deze prompt. ", ""),
                afspraken or "(geen)", kaart))
 
@@ -379,12 +522,14 @@ def advies_prompt(context, afspraken, voorstel, code, kaart):
             "open vragen die eerst beantwoord moeten worden. Antwoord in het Nederlands, "
             "zakelijk, hooguit 12 punten, de belangrijkste eerst. De belangrijkste code staat "
             "hieronder, met een kaart van de hele codebase (per bestand de imports en de "
-            "functies). Wil je een ander bestand zien, lees het dan (read_file, pad ten opzichte "
-            "van %s), maar spaarzaam: elke leesactie kost tokens. Voer geen opdrachten uit."
+            "functies). Wil je een ander bestand uit de kaart zien, lees het dan met read_file en "
+            "het volledige pad %s/<pad uit de kaart> (alleen bestanden uit de kaart, nooit iets in "
+            ".git), maar spaarzaam: elke leesactie kost tokens. Voer geen opdrachten uit."
             "\n\nProject: %s\n\n--- Afspraken ---\n%s\n\n--- Voorstel ---\n%s"
             "\n\n--- Bestaande code ---\n%s\n\n--- Kaart van de codebase ---\n%s"
             % (os.getcwd(), context, afspraken or "(geen)", voorstel,
-               code or "(geen meegegeven)", kaart or "(geen)"))
+               code or "(geen meegegeven)",
+               kaart or "(geen kaart: beoordeel alleen de meegegeven bestanden en lees geen andere)"))
 
 
 # ---------------------------------------------------------------- rapport
@@ -555,8 +700,9 @@ def main(argv):
             return 2
         bestanden = [b for b in git("ls-files", "-z", "--", *(inst["paden"] or ["."]))
                      .split("\0") if b and os.path.isfile(b)]
-        taken.append(("advies", advies_prompt(inst["context"], afspraken, tekst, code,
-                                              overzicht(bestanden)), SCHEMA_ADVIES, None))
+        prompt, _ = met_kaart(lambda k: advies_prompt(inst["context"], afspraken, tekst, code, k),
+                              bestanden)
+        taken.append(("advies", prompt, SCHEMA_ADVIES, None))
     elif modus == "alles":
         bestanden = [b for b in git("ls-files", "-z", "--", *(inst["paden"] or ["."]))
                      .split("\0") if b and os.path.isfile(b)]
@@ -574,9 +720,12 @@ def main(argv):
         for n, (inhoud, paden) in enumerate(code_delen(nieuw), 1):
             taken.append(("deel-%02d" % n, review_prompt(inst["context"], inhoud, "code"),
                           SCHEMA_REVIEW, paden))
-        kaart = overzicht(bestanden)
-        taken.append(("samenhang", samenhang_prompt(inst["context"], afspraken, kaart),
-                      SCHEMA_REVIEW, None))
+        # Zonder kaart (taal niet ondersteund) heeft de samenhangronde niets om mee te werken
+        prompt, kaart = met_kaart(lambda k: samenhang_prompt(inst["context"], afspraken, k), bestanden)
+        if kaart:
+            taken.append(("samenhang", prompt, SCHEMA_REVIEW, None))
+        else:
+            print("  samenhang  overgeslagen: geen kaart van de code (taal niet ondersteund)")
     else:
         if args:
             diff = git("diff", *args)
